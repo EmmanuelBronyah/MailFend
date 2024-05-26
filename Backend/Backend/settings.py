@@ -16,20 +16,20 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECURE_SSL_REDIRECT = False
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 CSRF_COOKIE_HTTPONLY = False
 CSRF_COOKIE_SECURE = True
 
-SESSION_COOKIE_SECURE = True 
+SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 
-SESSION_ENGINE = 'django.contrib.sessions.backends.signed_cookies'
-SESSION_COOKIE_SAMESITE = 'Lax'
-CSRF_COOKIE_SAMESITE = 'Lax'
+SESSION_ENGINE = "django.contrib.sessions.backends.signed_cookies"
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
 
 SESSION_COOKIE_HTTPONLY = True
-SESSION_COOKIE_SECURE = True  
+SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_HTTPONLY = False
 CSRF_COOKIE_SECURE = True
 
@@ -55,7 +55,6 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    
     "main",
     "corsheaders",
     "rest_framework",
@@ -149,9 +148,9 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 CORS_ALLOW_CREDENTIALS = True
 CORS_ORIGIN_ALLOW_ALL = False
 CORS_ORIGIN_WHITELIST = [
-    'https://localhost:5173',
+    "https://localhost:5173",
 ]
 
 CSRF_TRUSTED_ORIGINS = [
-    'https://localhost:5173',
+    "https://localhost:5173",
 ]

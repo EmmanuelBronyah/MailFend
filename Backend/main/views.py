@@ -15,6 +15,7 @@ import httplib2
 import socket
 import base64
 import quopri
+from .serializers import MessageIdSerializer
 
 current_directory = os.path.dirname(__file__)
 credentials_file_path = os.path.join(current_directory, "credentials.json")
@@ -60,9 +61,11 @@ class RedirectView(APIView):
 
 
 class MainPageView(APIView):
+    message_id_serializer_class = MessageIdSerializer
 
     @staticmethod
     def refresh_token(credentials):
+        print("REFRESHING CREDENTIALS")
         credentials = Credentials(
             token=credentials["token"],
             refresh_token=credentials["refresh_token"],
@@ -75,7 +78,7 @@ class MainPageView(APIView):
         credentials["token"] = credentials.token
 
         return credentials
-        
+
     @staticmethod
     def get_charset_and_encoding(headers):
         charset = "utf-8"
@@ -167,10 +170,7 @@ class MainPageView(APIView):
         messages = []
 
         results = (
-            service.users()
-            .messages()
-            .list(userId="me", labelIds=[mailbox])
-            .execute()
+            service.users().messages().list(userId="me", labelIds=[mailbox]).execute()
         )
         message_data = results.get("messages")
         if message_data:
@@ -237,7 +237,7 @@ class MainPageView(APIView):
     def get_user_profile(service):
         profile = service.users().getProfile(userId="me").execute()
         return profile
-    
+
     @staticmethod
     def get_mailbox_name(mailbox):
         match mailbox.lower():
@@ -259,14 +259,14 @@ class MainPageView(APIView):
             case "bin":
                 mailbox = "TRASH"
                 return mailbox
-    
-    def get(self, request, *args, **kwargs):        
+
+    def get(self, request, *args, **kwargs):
         if "credentials" not in request.session:
             print("Credentials not in request session")
             return Response(
                 {"error": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED
             )
-        
+
         credentials = request.session["credentials"]
         credentials = Credentials(**credentials)
 
@@ -274,7 +274,7 @@ class MainPageView(APIView):
             if all([credentials.expired, credentials.refresh_token]):
                 credentials = self.refresh_token(credentials)
                 request.session["credentials"] = credentials
-        
+
         service = build("gmail", "v1", credentials=credentials)
 
         action = request.GET.get("action")
@@ -283,16 +283,64 @@ class MainPageView(APIView):
                 profile = self.get_user_profile(service)
                 return Response({"res": profile}, status=status.HTTP_200_OK)
             case "fetch_emails":
-                mailbox_unique = ["forums", "updates", "personal", "promotions", "social", "bin"]
+                mailbox_unique = [
+                    "forums",
+                    "updates",
+                    "personal",
+                    "promotions",
+                    "social",
+                    "bin",
+                ]
                 mailbox = request.GET.get("mailbox")
-                mailbox = self.get_mailbox_name(mailbox) if mailbox.lower() in mailbox_unique else mailbox.upper()
+                mailbox = (
+                    self.get_mailbox_name(mailbox)
+                    if mailbox.lower() in mailbox_unique
+                    else mailbox.upper()
+                )
                 messages = self.fetch_emails(service, mailbox)
-                
+
                 return (
                     Response({"res": messages}, status=status.HTTP_200_OK)
                     if messages
-                    else Response({"res": "No emails in mailbox."}, status=status.HTTP_200_OK)
+                    else Response(
+                        {"res": "No emails in mailbox."}, status=status.HTTP_200_OK
+                    )
                 )
+
+    @staticmethod
+    def mark_as_read(service, message_id):
+        service.users().messages().modify(
+            userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}
+        ).execute()
+        return "Message marked as read."
+
+    def post(self, request, *args, **kwargs):
+        if "credentials" not in request.session:
+            print("Credentials not in request session")
+            return Response(
+                {"error": "Unauthorized"}, status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        credentials = request.session["credentials"]
+        credentials = Credentials(**credentials)
+
+        if not credentials.valid:
+            if all([credentials.expired, credentials.refresh_token]):
+                credentials = self.refresh_token(credentials)
+                request.session["credentials"] = credentials
+
+        service = build("gmail", "v1", credentials=credentials)
+
+        action = request.data.get("action")
+        match action:
+            case "mark_as_read":
+                message_id = request.data.get("message_id")
+                serializer = self.message_id_serializer_class(data=request.data)
+                if serializer.is_valid():
+                    message_id = serializer.validated_data["message_id"]
+                    response = self.mark_as_read(service, message_id)
+                    return Response({"res": response}, status=status.HTTP_200_OK)
+            
 
 
 class LogoutView(APIView):

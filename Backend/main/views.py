@@ -15,7 +15,7 @@ import httplib2
 import socket
 import base64
 import quopri
-from .serializers import MessageIdSerializer
+from .serializers import MessageIdSerializer, MoveMessageSerializer
 
 current_directory = os.path.dirname(__file__)
 credentials_file_path = os.path.join(current_directory, "credentials.json")
@@ -62,6 +62,7 @@ class RedirectView(APIView):
 
 class MainPageView(APIView):
     message_id_serializer_class = MessageIdSerializer
+    move_message_serializer_class = MoveMessageSerializer
 
     @staticmethod
     def refresh_token(credentials):
@@ -306,7 +307,27 @@ class MainPageView(APIView):
                         {"res": "No emails in mailbox."}, status=status.HTTP_200_OK
                     )
                 )
+    
+    @staticmethod
+    def move_message(service, message_id, mailbox):
+        service.users().messages().modify(
+            userId="me", id=message_id, body={"addLabelIds": [mailbox]}
+        ).execute()
+        return f'Message moved to the {mailbox} mailbox.'
 
+    @staticmethod
+    def trash_message(service, message_id):
+        service.users().messages().trash(userId="me", id=message_id).execute()
+        return f'Message moved to TRASH.'
+
+    @staticmethod
+    def create_draft(service, message_id):
+        message = service.users().messages().get(userId="me", id=message_id, format="raw").execute()
+        raw_message = message["raw"]
+        draft = {"message": {"raw": raw_message}}
+        created_draft = service.users().drafts().create(userId="me", body=draft).execute()
+        return f'Message moved to the Draft mailbox.'
+    
     @staticmethod
     def mark_as_read(service, message_id):
         service.users().messages().modify(
@@ -340,7 +361,42 @@ class MainPageView(APIView):
                     message_id = serializer.validated_data["message_id"]
                     response = self.mark_as_read(service, message_id)
                     return Response({"res": response}, status=status.HTTP_200_OK)
-            
+            case "create_draft":
+                message_id = request.data.get("message_id")
+                serializer = self.move_message_serializer_class(data=request.data)
+                if serializer.is_valid():
+                    message_id = serializer.validated_data["message_id"]
+                    response = self.create_draft(service, message_id)
+                    return Response({"res": response}, status=status.HTTP_200_OK)
+            case "move_message":
+                message_id = request.data.get("message_id")
+                serializer = self.move_message_serializer_class(data=request.data)
+                if serializer.is_valid():
+                    message_id = serializer.validated_data["message_id"]
+                    mailbox = serializer.validated_data["mailbox"]
+                    mailbox_unique = [
+                        "forums",
+                        "updates",
+                        "personal",
+                        "promotions",
+                        "social",
+                        "bin",
+                    ]
+                    mailbox = (
+                        self.get_mailbox_name(mailbox)
+                        if mailbox.lower() in mailbox_unique
+                        else mailbox.upper()
+                    )
+                    response = self.move_message(service, message_id, mailbox)
+                    return Response({"res": response}, status=status.HTTP_200_OK)
+            case "trash_message":
+                message_id = request.data.get("message_id")
+                serializer = self.move_message_serializer_class(data=request.data)
+                if serializer.is_valid():
+                    message_id = serializer.validated_data["message_id"]
+                    mailbox = serializer.validated_data["mailbox"]
+                    response = self.trash_message(service, message_id)
+                    return Response({"res": response}, status=status.HTTP_200_OK)
 
 
 class LogoutView(APIView):

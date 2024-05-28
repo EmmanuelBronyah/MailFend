@@ -1,21 +1,23 @@
 import os
-from django.shortcuts import redirect
-from django.contrib.auth import logout
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from google.auth.exceptions import RefreshError
-import requests
-from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
-import httplib2
 import socket
 import base64
 import quopri
-from .serializers import MessageIdSerializer, MoveMessageSerializer
+import httplib2
+import requests
+import mimetypes
+from rest_framework import status
+from django.shortcuts import redirect
+from email.message import EmailMessage
+from django.contrib.auth import logout
+from rest_framework.views import APIView
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from rest_framework.response import Response
+from google.auth.exceptions import RefreshError
+from google.oauth2.credentials import Credentials
+from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
+from .serializers import MessageIdSerializer, MoveMessageSerializer, ComposeMessageSerializer
 
 current_directory = os.path.dirname(__file__)
 credentials_file_path = os.path.join(current_directory, "credentials.json")
@@ -63,6 +65,7 @@ class RedirectView(APIView):
 class MainPageView(APIView):
     message_id_serializer_class = MessageIdSerializer
     move_message_serializer_class = MoveMessageSerializer
+    compose_message_serializer_class = ComposeMessageSerializer
 
     @staticmethod
     def refresh_token(credentials):
@@ -309,6 +312,29 @@ class MainPageView(APIView):
                 )
     
     @staticmethod
+    def compose_message(service, subject, to, body, attachments=None):
+        message = EmailMessage()
+        
+        message["Subject"] = subject
+        message["To"] = to
+        message.set_content(body)
+
+        if attachment:
+          for attachment in attachments:
+            mime_type, typ = mimetypes.guess_type(attachment["filename"])
+            print("MIME TYPE -> ", mime_type, "TYP -> ", typ)
+            if mime_type is None:
+                mime_type = "application/octet-stream"
+
+            main_type, sub_type = mime_type.split("/", 1)
+            print("SPLIT MIME TYPE -> ", mime_type.split("/"), "MAIN TYPE -> ", main_type, "SUB TYPE -> ", sub_type)
+            content = base64.urlsafe_b64decode(attachment["content"])
+            message.add_attachment(content, maintype=main_type, subtype=sub_type, filename=attachment["filename"])
+        raw_message = base64.urlsafe_b64decode(message.as_bytes()).decode()
+        service.users().messages().send(userId="me", body={"raw": raw_message}).execute()
+        return f'Message sent successfully.'
+    
+    @staticmethod
     def move_message(service, message_id, mailbox):
         service.users().messages().modify(
             userId="me", id=message_id, body={"addLabelIds": [mailbox]}
@@ -355,21 +381,18 @@ class MainPageView(APIView):
         action = request.data.get("action")
         match action:
             case "mark_as_read":
-                message_id = request.data.get("message_id")
                 serializer = self.message_id_serializer_class(data=request.data)
                 if serializer.is_valid():
                     message_id = serializer.validated_data["message_id"]
                     response = self.mark_as_read(service, message_id)
                     return Response({"res": response}, status=status.HTTP_200_OK)
             case "create_draft":
-                message_id = request.data.get("message_id")
                 serializer = self.move_message_serializer_class(data=request.data)
                 if serializer.is_valid():
                     message_id = serializer.validated_data["message_id"]
                     response = self.create_draft(service, message_id)
                     return Response({"res": response}, status=status.HTTP_200_OK)
             case "move_message":
-                message_id = request.data.get("message_id")
                 serializer = self.move_message_serializer_class(data=request.data)
                 if serializer.is_valid():
                     message_id = serializer.validated_data["message_id"]
@@ -390,14 +413,24 @@ class MainPageView(APIView):
                     response = self.move_message(service, message_id, mailbox)
                     return Response({"res": response}, status=status.HTTP_200_OK)
             case "trash_message":
-                message_id = request.data.get("message_id")
                 serializer = self.move_message_serializer_class(data=request.data)
                 if serializer.is_valid():
                     message_id = serializer.validated_data["message_id"]
                     mailbox = serializer.validated_data["mailbox"]
                     response = self.trash_message(service, message_id)
                     return Response({"res": response}, status=status.HTTP_200_OK)
-
+            case "compose_message":
+              message_data = request.data.get("message_data")
+              serializer = self.compose_message_serializer_class(data=message_data)
+              if serializer.is_valid():
+                subject = serializer.validated_data["Subject"]
+                to = serializer.validated_data["To"]
+                body = serializer.validated_data["Body"]
+                attachments = serializer.validated_data["Attachments"]
+                response = self.compose_message(service, subject, to, body, attachments)
+                return Response({"res": response}, status=status.HTTP_200_OK)
+              
+              
 
 class LogoutView(APIView):
 

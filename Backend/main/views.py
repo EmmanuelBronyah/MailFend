@@ -170,11 +170,12 @@ class MainPageView(APIView):
 
         return message_object
 
-    def fetch_emails(self, service, mailbox):
+    def fetch_emails(self, service, mailbox, query=None):
         messages = []
 
+        print("QUERY IN FETCH EMAILS -> ", query)
         results = (
-            service.users().messages().list(userId="me", labelIds=[mailbox]).execute()
+            service.users().messages().list(userId="me", labelIds=[mailbox], q=query).execute()
         )
         message_data = results.get("messages")
         if message_data:
@@ -301,7 +302,10 @@ class MainPageView(APIView):
                     if mailbox.lower() in mailbox_unique
                     else mailbox.upper()
                 )
-                messages = self.fetch_emails(service, mailbox)
+                q = request.GET.get("q")
+                # datetime.strptime(criteria["start_date"], "%Y-%m-%d").strftime("%Y/%m/%d")
+                # datetime.strptime(criteria["end_date"], "%Y-%m-%d").strftime("%Y/%m/%d")
+                messages = self.fetch_emails(service, mailbox, q)
 
                 return (
                     Response({"res": messages}, status=status.HTTP_200_OK)

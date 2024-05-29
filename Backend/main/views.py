@@ -17,7 +17,11 @@ from rest_framework.response import Response
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
-from .serializers import MessageIdSerializer, MoveMessageSerializer, ComposeMessageSerializer
+from .serializers import (
+    MessageIdSerializer,
+    MoveMessageSerializer,
+    ComposeMessageSerializer,
+)
 
 current_directory = os.path.dirname(__file__)
 credentials_file_path = os.path.join(current_directory, "credentials.json")
@@ -173,27 +177,33 @@ class MainPageView(APIView):
     def fetch_emails(self, service, mailbox, query=None):
         messages = []
 
-        print("QUERY IN FETCH EMAILS -> ", query)
         results = (
-            service.users().messages().list(userId="me", labelIds=[mailbox], q=query).execute()
+            service.users()
+            .messages()
+            .list(userId="me", labelIds=[mailbox], q=query)
+            .execute()
         )
         message_data = results.get("messages")
         if message_data:
             for data in message_data:
                 message_object = {
                     "Id": "",
+                    "Message-ID": "",
+                    "Thread-ID": "",
                     "From": "",
                     "To": "",
                     "Subject": "",
                     "Date": "",
                     "Body": "",
+                    "References": "",
                     "UNREAD": False,
                     "Attachments": [],
                 }
-
                 message_id = data.get("id")
-                print(message_id)
                 message_object["Id"] = message_id
+                print(message_id)
+                thread_id = data.get("threadId")
+                message_object["Thread-ID"] = thread_id
 
                 message = (
                     service.users().messages().get(userId="me", id=message_id).execute()
@@ -314,50 +324,179 @@ class MainPageView(APIView):
                         {"res": "No emails in mailbox."}, status=status.HTTP_200_OK
                     )
                 )
-    
+
+    @staticmethod
+    def foward_message(service, message_id, to, body, attachments):
+        message = (
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="raw")
+            .execute()
+        )
+        raw_message = base64.urlsafe_b64decode(message["raw"])
+
+        foward_message = EmailMessage()
+        if not body:
+            foward_message.set_content(raw_message)
+        else:
+            combined_message_content = f'{body}\n\n--- Forwarded message ---\n\n{raw_message}'
+            foward_message.set_content(combined_message_content)
+        
+        subject = ""
+        sender = ""
+        headers = message["payload"]["headers"]
+        for header in headers:
+            match header["name"]:
+                case "Subject":
+                    subject = header["value"]
+                case "From":
+                    sender = header["value"]
+
+        foward_message["To"] = to
+        foward_message["Subject"] = f'Fwd: {subject}'
+        foward_message["From"] = sender
+        
+        if attachment:
+            for attachment in attachments:
+                mime_type, typ = mimetypes.guess_type(attachment["filename"])
+                print("MIME TYPE -> ", mime_type, "TYP -> ", typ)
+                if mime_type is None:
+                    mime_type = "application/octet-stream"
+
+                main_type, sub_type = mime_type.split("/", 1)
+                print(
+                    "SPLIT MIME TYPE -> ",
+                    mime_type.split("/"),
+                    "MAIN TYPE -> ",
+                    main_type,
+                    "SUB TYPE -> ",
+                    sub_type,
+                )
+                content = base64.urlsafe_b64decode(attachment["content"])
+                foward_message.add_attachment(
+                    content,
+                    maintype=main_type,
+                    subtype=sub_type,
+                    filename=attachment["filename"],
+                )
+        foward_raw_message = base64.urlsafe_b64decode(foward_message.as_bytes()).decode()
+        message_body = {"raw": foward_raw_message}
+        service.users().messages().send(userId="me", body=message_body).execute()
+        return f"Message fowarded successfully."
+
+    @staticmethod
+    def create_reply(
+        service,
+        sender,
+        subject,
+        to,
+        message,
+        thread_id,
+        in_reply_to,
+        references,
+        attachments,
+    ):
+        message = EmailMessage()
+
+        message["From"] = sender
+        message["Subject"] = subject
+        message["To"] = to
+        message["In-Reply-To"] = in_reply_to
+        message["References"] = references
+        message.set_content(message)
+
+        if attachment:
+            for attachment in attachments:
+                mime_type, typ = mimetypes.guess_type(attachment["filename"])
+                print("MIME TYPE -> ", mime_type, "TYP -> ", typ)
+                if mime_type is None:
+                    mime_type = "application/octet-stream"
+
+                main_type, sub_type = mime_type.split("/", 1)
+                print(
+                    "SPLIT MIME TYPE -> ",
+                    mime_type.split("/"),
+                    "MAIN TYPE -> ",
+                    main_type,
+                    "SUB TYPE -> ",
+                    sub_type,
+                )
+                content = base64.urlsafe_b64decode(attachment["content"])
+                message.add_attachment(
+                    content,
+                    maintype=main_type,
+                    subtype=sub_type,
+                    filename=attachment["filename"],
+                )
+        raw_message = base64.urlsafe_b64decode(message.as_bytes()).decode()
+        message_body = {"raw": raw_message, "threadId": thread_id}
+        service.users().messages().send(userId="me", body=message_body).execute()
+        return f"Message sent successfully."
+
     @staticmethod
     def compose_message(service, subject, to, body, attachments=None):
         message = EmailMessage()
-        
+
         message["Subject"] = subject
         message["To"] = to
         message.set_content(body)
 
         if attachment:
-          for attachment in attachments:
-            mime_type, typ = mimetypes.guess_type(attachment["filename"])
-            print("MIME TYPE -> ", mime_type, "TYP -> ", typ)
-            if mime_type is None:
-                mime_type = "application/octet-stream"
+            for attachment in attachments:
+                mime_type, typ = mimetypes.guess_type(attachment["filename"])
+                print("MIME TYPE -> ", mime_type, "TYP -> ", typ)
+                if mime_type is None:
+                    mime_type = "application/octet-stream"
 
-            main_type, sub_type = mime_type.split("/", 1)
-            print("SPLIT MIME TYPE -> ", mime_type.split("/"), "MAIN TYPE -> ", main_type, "SUB TYPE -> ", sub_type)
-            content = base64.urlsafe_b64decode(attachment["content"])
-            message.add_attachment(content, maintype=main_type, subtype=sub_type, filename=attachment["filename"])
+                main_type, sub_type = mime_type.split("/", 1)
+                print(
+                    "SPLIT MIME TYPE -> ",
+                    mime_type.split("/"),
+                    "MAIN TYPE -> ",
+                    main_type,
+                    "SUB TYPE -> ",
+                    sub_type,
+                )
+                content = base64.urlsafe_b64decode(attachment["content"])
+                message.add_attachment(
+                    content,
+                    maintype=main_type,
+                    subtype=sub_type,
+                    filename=attachment["filename"],
+                )
         raw_message = base64.urlsafe_b64decode(message.as_bytes()).decode()
-        service.users().messages().send(userId="me", body={"raw": raw_message}).execute()
-        return f'Message sent successfully.'
-    
+        service.users().messages().send(
+            userId="me", body={"raw": raw_message}
+        ).execute()
+        return f"Message sent successfully."
+
     @staticmethod
     def move_message(service, message_id, mailbox):
         service.users().messages().modify(
             userId="me", id=message_id, body={"addLabelIds": [mailbox]}
         ).execute()
-        return f'Message moved to the {mailbox} mailbox.'
+        return f"Message moved to the {mailbox} mailbox."
 
     @staticmethod
     def trash_message(service, message_id):
         service.users().messages().trash(userId="me", id=message_id).execute()
-        return f'Message moved to TRASH.'
+        return f"Message moved to TRASH."
 
     @staticmethod
     def create_draft(service, message_id):
-        message = service.users().messages().get(userId="me", id=message_id, format="raw").execute()
+        message = (
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="raw")
+            .execute()
+        )
         raw_message = message["raw"]
         draft = {"message": {"raw": raw_message}}
-        created_draft = service.users().drafts().create(userId="me", body=draft).execute()
-        return f'Message moved to the Draft mailbox.'
-    
+        created_draft = (
+            service.users().drafts().create(userId="me", body=draft).execute()
+        )
+        return f"Message moved to the Draft mailbox."
+
     @staticmethod
     def mark_as_read(service, message_id):
         service.users().messages().modify(
@@ -424,17 +563,54 @@ class MainPageView(APIView):
                     response = self.trash_message(service, message_id)
                     return Response({"res": response}, status=status.HTTP_200_OK)
             case "compose_message":
-              message_data = request.data.get("message_data")
-              serializer = self.compose_message_serializer_class(data=message_data)
-              if serializer.is_valid():
-                subject = serializer.validated_data["Subject"]
-                to = serializer.validated_data["To"]
-                body = serializer.validated_data["Body"]
-                attachments = serializer.validated_data["Attachments"]
-                response = self.compose_message(service, subject, to, body, attachments)
-                return Response({"res": response}, status=status.HTTP_200_OK)
-              
-              
+                message_data = request.data.get("message_data")
+                serializer = self.compose_message_serializer_class(data=message_data)
+                if serializer.is_valid():
+                    subject = serializer.validated_data["Subject"]
+                    to = serializer.validated_data["To"]
+                    body = serializer.validated_data["Body"]
+                    attachments = serializer.validated_data["Attachments"]
+                    response = self.compose_message(
+                        service, subject, to, body, attachments
+                    )
+                    return Response({"res": response}, status=status.HTTP_200_OK)
+            case "reply_message":
+                message_data = request.data.get("message_data")
+                serializer = self.compose_message_serializer_class(data=message_data)
+                if serializer.is_valid():
+                    sender = serializer.validated_data["Sender"]
+                    to = serializer.validated_data["To"]
+                    subject = serializer.validated_data["Subject"]
+                    message = serializer.validated_data["Message"]
+                    thread_id = serializer.validated_data["ThreadId"]
+                    in_reply_to = serializer.validated_data["InReplyTo"]
+                    references = serializer.validated_data["References"]
+                    attachments = serializer.validated_data["Attachments"]
+                    response = self.create_reply(
+                        service,
+                        sender,
+                        subject,
+                        to,
+                        message,
+                        thread_id,
+                        in_reply_to,
+                        references,
+                        attachments,
+                    )
+                    return Response({"res": response}, status=status.HTTP_200_OK)
+            case "foward_message":
+                message_data = request.data.get("message_data")
+                serializer = self.compose_message_serializer_class(data=message_data)
+                if serializer.is_valid():
+                    message_id = serializer.validated_data["Id"]
+                    to = serializer.validated_data["To"]
+                    message = serializer.validated_data["Message"]
+                    attachments = serializer.validated_data["Attachments"]
+                    response = self.foward_message(
+                        service, message_id, to, body, attachments
+                    )
+                    return Response({"res": response}, status=status.HTTP_200_OK)
+
 
 class LogoutView(APIView):
 

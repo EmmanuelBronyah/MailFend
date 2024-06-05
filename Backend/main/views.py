@@ -21,7 +21,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
 from .serializers import (
     MessageIdSerializer,
-    MoveMessageSerializer,
+    MarkMessageSerializer,
     ComposeMessageSerializer,
 )
 
@@ -70,7 +70,7 @@ class RedirectView(APIView):
 
 class MainPageView(APIView):
     message_id_serializer_class = MessageIdSerializer
-    move_message_serializer_class = MoveMessageSerializer
+    mark_message_serializer_class = MarkMessageSerializer
     compose_message_serializer_class = ComposeMessageSerializer
 
     @staticmethod
@@ -461,7 +461,14 @@ class MainPageView(APIView):
         return f"Message sent successfully."
 
     @staticmethod
-    def move_message(service, message_id, mailbox):
+    def unmark_message(service, message_id, mailbox):
+        service.users().messages().modify(
+            userId="me", id=message_id, body={"addLabelIds": [mailbox]}
+        ).execute()
+        return f"Message moved to the {mailbox} mailbox."
+
+    @staticmethod
+    def mark_message(service, message_id, mailbox):
         service.users().messages().modify(
             userId="me", id=message_id, body={"addLabelIds": [mailbox]}
         ).execute()
@@ -486,6 +493,13 @@ class MainPageView(APIView):
             service.users().drafts().create(userId="me", body=draft).execute()
         )
         return f"Message moved to the Draft mailbox."
+
+    @staticmethod
+    def mark_as_unread(service, message_id):
+        service.users().messages().modify(
+            userId="me", id=message_id, body={"addLabelIds": ["UNREAD"]}
+        ).execute()
+        return "Message marked as unread."
 
     @staticmethod
     def mark_as_read(service, message_id):
@@ -519,14 +533,20 @@ class MainPageView(APIView):
                     message_id = serializer.validated_data["message_id"]
                     response = self.mark_as_read(service, message_id)
                     return Response({"res": response}, status=status.HTTP_200_OK)
+            case "mark_as_unread":
+                serializer = self.message_id_serializer_class(data=request.data)
+                if serializer.is_valid():
+                    message_id = serializer.validated_data["message_id"]
+                    response = self.mark_as_unread(service, message_id)
+                    return Response({"res": response}, status=status.HTTP_200_OK)
             case "create_draft":
-                serializer = self.move_message_serializer_class(data=request.data)
+                serializer = self.mark_message_serializer_class(data=request.data)
                 if serializer.is_valid():
                     message_id = serializer.validated_data["message_id"]
                     response = self.create_draft(service, message_id)
                     return Response({"res": response}, status=status.HTTP_200_OK)
-            case "move_message":
-                serializer = self.move_message_serializer_class(data=request.data)
+            case "mark_message":
+                serializer = self.mark_message_serializer_class(data=request.data)
                 if serializer.is_valid():
                     message_id = serializer.validated_data["message_id"]
                     mailbox = serializer.validated_data["mailbox"]
@@ -543,10 +563,30 @@ class MainPageView(APIView):
                         if mailbox.lower() in mailbox_unique
                         else mailbox.upper()
                     )
-                    response = self.move_message(service, message_id, mailbox)
+                    response = self.mark_message(service, message_id, mailbox)
+                    return Response({"res": response}, status=status.HTTP_200_OK)
+            case "unmark_message":
+                serializer = self.mark_message_serializer_class(data=request.data)
+                if serializer.is_valid():
+                    message_id = serializer.validated_data["message_id"]
+                    mailbox = serializer.validated_data["mailbox"]
+                    mailbox_unique = [
+                        "forums",
+                        "updates",
+                        "personal",
+                        "promotions",
+                        "social",
+                        "bin",
+                    ]
+                    mailbox = (
+                        self.get_mailbox_name(mailbox)
+                        if mailbox.lower() in mailbox_unique
+                        else mailbox.upper()
+                    )
+                    response = self.unmark_message(service, message_id, mailbox)
                     return Response({"res": response}, status=status.HTTP_200_OK)
             case "trash_message":
-                serializer = self.move_message_serializer_class(data=request.data)
+                serializer = self.mark_message_serializer_class(data=request.data)
                 if serializer.is_valid():
                     message_id = serializer.validated_data["message_id"]
                     mailbox = serializer.validated_data["mailbox"]

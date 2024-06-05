@@ -6,7 +6,7 @@ class MessageIdSerializer(serializers.Serializer):
     message_id = serializers.CharField()
 
 
-class MoveMessageSerializer(serializers.Serializer):
+class MarkMessageSerializer(serializers.Serializer):
     action = serializers.CharField()
     message_id = serializers.CharField()
     mailbox = serializers.CharField()

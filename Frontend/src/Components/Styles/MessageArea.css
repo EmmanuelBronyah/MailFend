@@ -1,0 +1,20 @@
+.message-area {
+    display: flex;
+    flex-direction: row;
+  }
+  
+  .message-area h2 {
+    margin-top: 16px;
+    margin-bottom: 8px;
+    color: #000;
+  }
+  
+  .message-area .message {
+    border-bottom: 1px solid gray;
+    padding: 8px 0;
+  }
+  
+  .message-area .message:last-child {
+    border-bottom: none;
+  }
+  

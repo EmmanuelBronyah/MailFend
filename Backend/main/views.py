@@ -1,28 +1,37 @@
 import os
+import time
 import socket
 import base64
 import quopri
+import asyncio
 import httplib2
-import requests
+from datetime import datetime
+from dateutil import parser
 import mimetypes
 from email import policy
 from rest_framework import status
+from django.core.cache import cache
 from email.parser import BytesParser
 from django.shortcuts import redirect
 from email.message import EmailMessage
 from django.contrib.auth import logout
+from requests.exceptions import Timeout
 from rest_framework.views import APIView
+from requests.adapters import HTTPAdapter
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from rest_framework.response import Response
 from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
+# from .voice_command_processor import text_processor
+from asgiref.sync import sync_to_async, async_to_sync
 from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
 from .serializers import (
     MessageIdSerializer,
     MarkMessageSerializer,
     ComposeMessageSerializer,
+    VoiceTextSerializer,
 )
 
 current_directory = os.path.dirname(__file__)
@@ -65,13 +74,14 @@ class RedirectView(APIView):
             "scopes": credentials.scopes,
         }
 
-        return redirect("https://localhost:5173/main")
+        return redirect("https://localhost:5173/home")
 
 
 class MainPageView(APIView):
     message_id_serializer_class = MessageIdSerializer
     mark_message_serializer_class = MarkMessageSerializer
     compose_message_serializer_class = ComposeMessageSerializer
+    voice_text_serializer_class = VoiceTextSerializer
 
     @staticmethod
     def refresh_token(credentials):
@@ -88,6 +98,11 @@ class MainPageView(APIView):
         credentials["token"] = credentials.token
 
         return credentials
+
+    @staticmethod
+    async def get_user_profile(service):
+        profile = await sync_to_async(service.users().getProfile(userId="me").execute)()
+        return profile
 
     @staticmethod
     def get_charset_and_encoding(headers):
@@ -118,13 +133,15 @@ class MainPageView(APIView):
 
         return decoded_body
 
-    def parse_parts(self, parts, message_id, service, message_object):
+    async def parse_parts(self, parts, message_id, service, message_object):
         body_as_html = ""
         body_as_text = ""
 
         for part in parts:
             if part.get("parts"):
-                self.parse_parts(part["parts"], message_id, service, message_object)
+                await self.parse_parts(
+                    part["parts"], message_id, service, message_object
+                )
             else:
                 mime_type = part.get("mimeType")
                 body_data = part.get("body", {}).get("data")
@@ -154,13 +171,13 @@ class MainPageView(APIView):
 
                 elif attachment_id:
                     attachment_object = {"Id": "", "Filename": "", "Data": None}
-                    attachment = (
+                    attachment = await sync_to_async(
                         service.users()
                         .messages()
                         .attachments()
                         .get(userId="me", messageId=message_id, id=attachment_id)
-                        .execute()
-                    )
+                        .execute
+                    )()
                     attachment_data = base64.urlsafe_b64decode(attachment["data"])
                     filename = part.get("filename")
 
@@ -175,85 +192,6 @@ class MainPageView(APIView):
         message_object["Body"] = body_as_html if body_as_html else body_as_text
 
         return message_object
-
-    def fetch_emails(self, service, mailbox, query=None):
-        messages = []
-
-        results = (
-            service.users()
-            .messages()
-            .list(userId="me", labelIds=[mailbox], q=query)
-            .execute()
-        )
-        message_data = results.get("messages")
-        if message_data:
-            for data in message_data:
-                message_object = {
-                    "Id": "",
-                    "Message-ID": "",
-                    "Thread-ID": "",
-                    "From": "",
-                    "To": "",
-                    "Subject": "",
-                    "Date": "",
-                    "Body": "",
-                    "References": "",
-                    "UNREAD": False,
-                    "Attachments": [],
-                }
-                message_id = data.get("id")
-                message_object["Id"] = message_id
-                print(message_id)
-                thread_id = data.get("threadId")
-                message_object["Thread-ID"] = thread_id
-
-                message = (
-                    service.users().messages().get(userId="me", id=message_id).execute()
-                )
-                message_object["UNREAD"] = "UNREAD" in message.get("labelIds")
-
-                headers = message["payload"]["headers"]
-                for header in headers:
-                    if message_object.get(header["name"]) is not None:
-                        message_object[header["name"]] = header["value"]
-
-                parts = message["payload"].get("parts")
-                if parts:
-                    updated_message_object = self.parse_parts(
-                        parts, message_id, service, message_object
-                    )
-                    messages.append(updated_message_object)
-                else:
-                    try:
-                        charset, encoding = self.get_charset_and_encoding(headers)
-
-                        body_data = message["payload"]["body"]["data"]
-
-                        decoded_body = self.get_decoded_body(
-                            body_data, charset, encoding
-                        )
-
-                        message_object["Body"] = decoded_body
-                        messages.append(message_object)
-
-                    except (UnicodeDecodeError, base64.binascii.Error) as e:
-                        print(
-                            f"Failed to decode email body using {charset} with encoding {encoding}. Error: {e}"
-                        )
-                        body = base64.urlsafe_b64decode(body_data).decode(
-                            "iso-8859-1", errors="replace"
-                        )
-                        message_object["Body"] = body
-                        messages.append(message_object)
-
-            return messages
-
-        return None
-
-    @staticmethod
-    def get_user_profile(service):
-        profile = service.users().getProfile(userId="me").execute()
-        return profile
 
     @staticmethod
     def get_mailbox_name(mailbox):
@@ -277,7 +215,108 @@ class MainPageView(APIView):
                 mailbox = "TRASH"
                 return mailbox
 
-    def get(self, request, *args, **kwargs):
+    async def fetch_email(self, service, message_id):
+        cached_email = cache.get(message_id)
+        if cached_email:
+            print("EMAIL WAS CACHED")
+            return cached_email
+
+        message_object = {
+            "Id": message_id,
+            "Message-ID": "",
+            "Thread-ID": "",
+            "From": "",
+            "To": "",
+            "Subject": "",
+            "Date": "",
+            "Body": "",
+            "References": "",
+            "UNREAD": False,
+            "Attachments": [],
+        }
+
+        message = await sync_to_async(
+            service.users().messages().get(userId="me", id=message_id).execute
+        )()
+        message_object["Thread-ID"] = message.get("threadId")
+        message_object["UNREAD"] = "UNREAD" in message.get("labelIds", [])
+
+        headers = message.get("payload", {}).get("headers", [])
+        for header in headers:
+            if header["name"] in message_object:
+                message_object[header["name"]] = header["value"]
+
+        parts = message.get("payload", {}).get("parts")
+        if parts:
+            updated_message_object = await self.parse_parts(
+                parts, message_id, service, message_object
+            )
+            cache.set(
+                message_id, updated_message_object, timeout=None
+            )  # No timeout for indefinite caching
+            return updated_message_object
+        else:
+            try:
+                charset, encoding = self.get_charset_and_encoding(headers)
+                body_data = message["payload"]["body"]["data"]
+                decoded_body = self.get_decoded_body(body_data, charset, encoding)
+                message_object["Body"] = decoded_body
+            except (UnicodeDecodeError, base64.binascii.Error) as e:
+                print(
+                    f"Failed to decode email body using {charset} with encoding {encoding}. Error: {e}"
+                )
+                body = base64.urlsafe_b64decode(body_data).decode(
+                    "iso-8859-1", errors="replace"
+                )
+                message_object["Body"] = body
+            cache.set(message_id, message_object, timeout=None)  # No timeout for indefinite caching
+            return message_object
+
+    async def fetch_emails(
+        self,
+        service,
+        mailbox,
+        q=None,
+        max_results=10,
+        page_token=None,
+        after_timestamp=None,
+    ):
+        all_emails = []
+        next_page_token = page_token
+
+        while True:
+            query = q or ""
+            if after_timestamp:
+                query += f" after:{after_timestamp}"
+
+            request = (
+                service.users()
+                .messages()
+                .list(
+                    userId="me",
+                    labelIds=[mailbox],
+                    q=query,
+                    maxResults=max_results,
+                    pageToken=next_page_token,
+                )
+            )
+            results = await sync_to_async(request.execute)()
+            message_data = results.get("messages", [])
+            if not message_data:
+                break  # No messages found, break out of the loop
+
+            next_page_token = results.get("nextPageToken")
+            print(f"Fetched {len(message_data)} messages for mailbox: {mailbox}")
+            tasks = [self.fetch_email(service, data.get("id")) for data in message_data]
+            messages = await asyncio.gather(*tasks)
+            all_emails.extend(messages)
+
+            if not next_page_token:
+                break
+
+        return all_emails, next_page_token
+
+    async def handle_get(self, request, *args, **kwargs):
         if "credentials" not in request.session:
             print("Credentials not in request session")
             return Response(
@@ -297,7 +336,7 @@ class MainPageView(APIView):
         action = request.GET.get("action")
         match action:
             case "get_profile":
-                profile = self.get_user_profile(service)
+                profile = await self.get_user_profile(service)
                 return Response({"res": profile}, status=status.HTTP_200_OK)
             case "fetch_emails":
                 mailbox_unique = [
@@ -314,39 +353,89 @@ class MainPageView(APIView):
                     if mailbox.lower() in mailbox_unique
                     else mailbox.upper()
                 )
-                q = request.GET.get("q")
-                # datetime.strptime(criteria["start_date"], "%Y-%m-%d").strftime("%Y/%m/%d")
-                # datetime.strptime(criteria["end_date"], "%Y-%m-%d").strftime("%Y/%m/%d")
-                messages = self.fetch_emails(service, mailbox, q)
+                cache_key = f"mailfetch_{mailbox}_emails"
+                print(f"CACHED KEY -> {cache_key}")
+                cached_emails = cache.get(cache_key) or []
+                if cached_emails:
+                    print("Returning cached emails")
 
-                return (
-                    Response({"res": messages}, status=status.HTTP_200_OK)
-                    if messages
-                    else Response(
-                        {"res": "No emails in mailbox."}, status=status.HTTP_200_OK
-                    )
+                # Extract the most recent timestamp from the cached emails
+                last_fetched_time = (
+                    max([email["Date"] for email in cached_emails])
+                    if cached_emails
+                    else None
+                )
+                print(f"Last fetched time -> {last_fetched_time}")
+                after_timestamp = (
+                    int(time.mktime(parser.parse(last_fetched_time).timetuple()))
+                    if last_fetched_time
+                    else None
+                )
+                print(f"After timestamp -> {after_timestamp}")
+                q = request.GET.get("q")
+                max_results = int(request.GET.get("max_results", 10))
+                page_token = request.GET.get("page_token", None)
+                print(f"Fetching emails from mailbox: {mailbox}")
+                messages, next_page_token = await self.fetch_emails(
+                    service, mailbox, q, max_results, page_token, after_timestamp
                 )
 
+                if not messages and not cached_emails:
+                    return Response(
+                        {"res": "No emails in mailbox."}, status=status.HTTP_200_OK
+                    )
+
+                # Append new messages to the cache and ensure they are sorted by date
+                new_email_ids = {email["Id"] for email in messages}
+                combined_emails = [
+                    email for email in cached_emails if email["Id"] not in new_email_ids
+                ] + messages
+
+                # Sort emails by date in descending order
+                combined_emails.sort(
+                    key=lambda x: parser.parse(x["Date"]), reverse=True
+                )
+
+                cache.set(
+                    cache_key, combined_emails, timeout=None
+                )  # Cache indefinitely
+                return Response(
+                    {"res": combined_emails, "next_page_token": next_page_token},
+                    status=status.HTTP_200_OK,
+                )
+
+    def get(self, request, *args, **kwargs):
+        return async_to_sync(self.handle_get)(request, *args, **kwargs)
+
     @staticmethod
-    def forward_message(service, message_id, to, message, attachments):
-        original_message = (
+    async def forward_message(service, message_id, to, message, attachments):
+        original_message = await sync_to_async(
             service.users()
             .messages()
             .get(userId="me", id=message_id, format="raw")
-            .execute()
+            .execute
+        )()
+        original_message_bytes = base64.urlsafe_b64decode(
+            original_message["raw"].encode("ASCII")
         )
-        original_message_bytes = base64.urlsafe_b64decode(original_message['raw'].encode('ASCII'))
-        
-        original_message_to_send = BytesParser(policy=policy.default).parsebytes(original_message_bytes)
+
+        original_message_to_send = BytesParser(policy=default).parsebytes(
+            original_message_bytes
+        )
 
         forward_message = EmailMessage()
         forward_message["To"] = to
         forward_message["Subject"] = f'Fwd: {original_message["snippet"]}'
-        forward_message["From"] = "ykwesi054@gmail.com"  
-        forward_message.set_content(f'{message} \n\n {original_message_to_send.get_body(preferencelist=("plain")).get_content()}')
-        
-        if original_message_to_send.get_body(preferencelist=('html')):
-            forward_message.add_alternative(f'{message} <br><br> {original_message_to_send.get_body(preferencelist=("html")).get_content()}', subtype="html")
+        forward_message["From"] = "ykwesi054@gmail.com"
+        forward_message.set_content(
+            f'{message} \n\n {original_message_to_send.get_body(preferencelist=("plain")).get_content()}'
+        )
+
+        if original_message_to_send.get_body(preferencelist=("html")):
+            forward_message.add_alternative(
+                f'{message} <br><br> {original_message_to_send.get_body(preferencelist=("html")).get_content()}',
+                subtype="html",
+            )
 
         if attachments:
             for attachment in attachments:
@@ -361,20 +450,19 @@ class MainPageView(APIView):
                     subtype=sub_type,
                     filename=attachment["filename"],
                 )
-            # for attachment in attachments:
-            #     with open(attachment, 'rb') as att:
-            #         file_data = att.read()
-            #         file_name = os.path.basename(attachment)
-            #         email_message.add_attachment(file_data, maintype='application', subtype='octet-stream', filename=file_name)
 
-        forward_raw_message = base64.urlsafe_b64encode(forward_message.as_bytes()).decode("utf-8")
+        forward_raw_message = base64.urlsafe_b64encode(
+            forward_message.as_bytes()
+        ).decode("utf-8")
         message_body = {"raw": forward_raw_message}
 
-        service.users().messages().send(userId="me", body=message_body).execute()
+        await sync_to_async(
+            service.users().messages().send(userId="me", body=message_body).execute
+        )()
         return "Message forwarded successfully."
-    
+
     @staticmethod
-    def create_reply(
+    async def create_reply(
         service,
         sender,
         subject,
@@ -396,20 +484,11 @@ class MainPageView(APIView):
 
         if attachments:
             for attachment in attachments:
-                mime_type, typ = mimetypes.guess_type(attachment["filename"])
-                print("MIME TYPE -> ", mime_type, "TYP -> ", typ)
+                mime_type, _ = mimetypes.guess_type(attachment["filename"])
                 if mime_type is None:
                     mime_type = "application/octet-stream"
 
                 main_type, sub_type = mime_type.split("/", 1)
-                print(
-                    "SPLIT MIME TYPE -> ",
-                    mime_type.split("/"),
-                    "MAIN TYPE -> ",
-                    main_type,
-                    "SUB TYPE -> ",
-                    sub_type,
-                )
                 content = base64.urlsafe_b64decode(attachment["content"])
                 email_message.add_attachment(
                     content,
@@ -419,12 +498,14 @@ class MainPageView(APIView):
                 )
         raw_message = base64.urlsafe_b64encode(email_message.as_bytes()).decode()
         message_body = {"raw": raw_message, "threadId": thread_id}
-        service.users().messages().send(userId="me", body=message_body).execute()
-        
+        await sync_to_async(
+            service.users().messages().send(userId="me", body=message_body).execute
+        )()
+
         return f"Message sent successfully."
 
     @staticmethod
-    def compose_message(service, subject, to, body, attachments=None):
+    async def compose_message(service, subject, to, body, attachments=None):
         message = EmailMessage()
 
         message["Subject"] = subject
@@ -433,20 +514,11 @@ class MainPageView(APIView):
 
         if attachments:
             for attachment in attachments:
-                mime_type, typ = mimetypes.guess_type(attachment["filename"])
-                print("MIME TYPE -> ", mime_type, "TYP -> ", typ)
+                mime_type, _ = mimetypes.guess_type(attachment["filename"])
                 if mime_type is None:
                     mime_type = "application/octet-stream"
 
                 main_type, sub_type = mime_type.split("/", 1)
-                print(
-                    "SPLIT MIME TYPE -> ",
-                    mime_type.split("/"),
-                    "MAIN TYPE -> ",
-                    main_type,
-                    "SUB TYPE -> ",
-                    sub_type,
-                )
                 content = base64.urlsafe_b64decode(attachment["content"])
                 message.add_attachment(
                     content,
@@ -455,60 +527,77 @@ class MainPageView(APIView):
                     filename=attachment["filename"],
                 )
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        service.users().messages().send(
-            userId="me", body={"raw": raw_message}
-        ).execute()
+        await sync_to_async(
+            service.users()
+            .messages()
+            .send(userId="me", body={"raw": raw_message})
+            .execute
+        )()
         return f"Message sent successfully."
 
     @staticmethod
-    def unmark_message(service, message_id, mailbox):
-        service.users().messages().modify(
-            userId="me", id=message_id, body={"addLabelIds": [mailbox]}
-        ).execute()
+    async def unmark_message(service, message_id, mailbox):
+        await sync_to_async(
+            service.users()
+            .messages()
+            .modify(userId="me", id=message_id, body={"addLabelIds": [mailbox]})
+            .execute
+        )()
         return f"Message moved to the {mailbox} mailbox."
 
     @staticmethod
-    def mark_message(service, message_id, mailbox):
-        service.users().messages().modify(
-            userId="me", id=message_id, body={"addLabelIds": [mailbox]}
-        ).execute()
+    async def mark_message(service, message_id, mailbox):
+        await sync_to_async(
+            service.users()
+            .messages()
+            .modify(userId="me", id=message_id, body={"addLabelIds": [mailbox]})
+            .execute
+        )()
         return f"Message moved to the {mailbox} mailbox."
 
     @staticmethod
-    def trash_message(service, message_id):
-        service.users().messages().trash(userId="me", id=message_id).execute()
+    async def trash_message(service, message_id):
+        await sync_to_async(
+            service.users().messages().trash(userId="me", id=message_id).execute
+        )()
         return f"Message moved to TRASH."
 
     @staticmethod
-    def create_draft(service, message_id):
-        message = (
+    async def create_draft(service, message_id):
+        message = await sync_to_async(
             service.users()
             .messages()
             .get(userId="me", id=message_id, format="raw")
-            .execute()
-        )
+            .execute
+        )()
         raw_message = message["raw"]
         draft = {"message": {"raw": raw_message}}
-        created_draft = (
-            service.users().drafts().create(userId="me", body=draft).execute()
-        )
+        await sync_to_async(
+            service.users().drafts().create(userId="me", body=draft).execute
+        )()
         return f"Message moved to the Draft mailbox."
 
     @staticmethod
-    def mark_as_unread(service, message_id):
-        service.users().messages().modify(
-            userId="me", id=message_id, body={"addLabelIds": ["UNREAD"]}
-        ).execute()
+    async def mark_as_unread(service, message_id):
+        await sync_to_async(
+            service.users()
+            .messages()
+            .modify(userId="me", id=message_id, body={"addLabelIds": ["UNREAD"]})
+            .execute
+        )()
         return "Message marked as unread."
 
     @staticmethod
-    def mark_as_read(service, message_id):
-        service.users().messages().modify(
-            userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}
-        ).execute()
+    async def mark_as_read(service, message_id):
+        await sync_to_async(
+            service.users()
+            .messages()
+            .modify(userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]})
+            .execute
+        )()
         return "Message marked as read."
 
-    def post(self, request, *args, **kwargs):
+    async def handle_post(self, request, *args, **kwargs):
         if "credentials" not in request.session:
             print("Credentials not in request session")
             return Response(
@@ -527,6 +616,12 @@ class MainPageView(APIView):
 
         action = request.data.get("action")
         match action:
+            # case "speech":
+            #     serializer = self.voice_text_serializer_class(data=request.data)
+            #     if serializer.is_valid():
+            #         voice_text = serializer.validated_data["voice_text"]
+            #         response = text_processor(voice_text)
+            #         return Response({"res": response}, status=status.HTTP_200_OK)
             case "mark_as_read":
                 serializer = self.message_id_serializer_class(data=request.data)
                 if serializer.is_valid():
@@ -586,35 +681,39 @@ class MainPageView(APIView):
                     response = self.unmark_message(service, message_id, mailbox)
                     return Response({"res": response}, status=status.HTTP_200_OK)
             case "trash_message":
-                serializer = self.mark_message_serializer_class(data=request.data)
+                serializer = self.message_id_serializer_class(data=request.data)
                 if serializer.is_valid():
                     message_id = serializer.validated_data["message_id"]
-                    mailbox = serializer.validated_data["mailbox"]
-                    response = self.trash_message(service, message_id)
+                    response = await sync_to_async(
+                        service.users()
+                        .messages()
+                        .trash(userId="me", id=message_id)
+                        .execute
+                    )()
                     return Response({"res": response}, status=status.HTTP_200_OK)
-            case "compose_message":
+            case "forward_message":
                 serializer = self.compose_message_serializer_class(data=request.data)
                 if serializer.is_valid():
-                    subject = serializer.validated_data["message_data"]["Subject"]
-                    to = serializer.validated_data["message_data"]["To"]
-                    body = serializer.validated_data["message_data"]["Body"]
-                    attachments = serializer.validated_data["message_data"]["Attachments"]
-                    response = self.compose_message(
-                        service, subject, to, body, attachments
+                    message_id = serializer.validated_data["message_id"]
+                    to = serializer.validated_data["to"]
+                    message = serializer.validated_data["message"]
+                    attachments = serializer.validated_data.get("attachments", [])
+                    response = await self.forward_message(
+                        service, message_id, to, message, attachments
                     )
                     return Response({"res": response}, status=status.HTTP_200_OK)
-            case "reply_message":
+            case "create_reply":
                 serializer = self.compose_message_serializer_class(data=request.data)
                 if serializer.is_valid():
-                    sender = serializer.validated_data["message_data"]["Sender"]
-                    to = serializer.validated_data["message_data"]["To"]
-                    subject = serializer.validated_data["message_data"]["Subject"]
-                    message = serializer.validated_data["message_data"]["Message"]
-                    thread_id = serializer.validated_data["message_data"]["ThreadId"]
-                    in_reply_to = serializer.validated_data["message_data"]["InReplyTo"]
-                    references = serializer.validated_data["message_data"]["References"]
-                    attachments = serializer.validated_data["message_data"]["Attachments"]
-                    response = self.create_reply(
+                    sender = "ykwesi054@gmail.com"
+                    subject = serializer.validated_data["subject"]
+                    to = serializer.validated_data["to"]
+                    message = serializer.validated_data["message"]
+                    thread_id = serializer.validated_data["thread_id"]
+                    in_reply_to = serializer.validated_data["in_reply_to"]
+                    references = serializer.validated_data["references"]
+                    attachments = serializer.validated_data.get("attachments", [])
+                    response = await self.create_reply(
                         service,
                         sender,
                         subject,
@@ -626,21 +725,27 @@ class MainPageView(APIView):
                         attachments,
                     )
                     return Response({"res": response}, status=status.HTTP_200_OK)
-            case "forward_message":
+            case "compose_message":
                 serializer = self.compose_message_serializer_class(data=request.data)
                 if serializer.is_valid():
-                    message_id = serializer.validated_data["message_data"]["Id"]
+                    subject = serializer.validated_data["message_data"]["Subject"]
                     to = serializer.validated_data["message_data"]["To"]
-                    message = serializer.validated_data["message_data"]["Message"]
-                    attachments = serializer.validated_data["message_data"]["Attachments"]
-                    response = self.forward_message(
-                        service, message_id, to, message, attachments
+                    body = serializer.validated_data["message_data"]["Body"]
+                    attachments = serializer.validated_data["message_data"].get("attachments", [])
+                    response = await self.compose_message(
+                        service, subject, to, body, attachments
                     )
                     return Response({"res": response}, status=status.HTTP_200_OK)
+
+        return Response({"error": "Invalid action"}, status=status.HTTP_400_BAD_REQUEST)
+
+    def post(self, request, *args, **kwargs):
+        return async_to_sync(self.handle_post)(request, *args, **kwargs)
 
 
 class LogoutView(APIView):
 
     def post(self, request, *args, **kwargs):
+        # cache.clear()
         logout(request)
         return Response({"res": "Successfully logged out."}, status=status.HTTP_200_OK)
